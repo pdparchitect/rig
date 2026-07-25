@@ -1,0 +1,823 @@
+#!/usr/bin/env bash
+#
+#  rig - assemble codex, pantalk and mcpshim into one agent.
+#
+#  rig is a distribution, not a harness. It ships no agent loop of its own:
+#  codex is the engine, pantalk is the channel edge, mcpshim is the tool edge.
+#  All rig does is generate each tool's native config, supervise the daemons,
+#  and hand every process the same cell environment.
+#
+#  The whole thing is one bash file on purpose. If the integration surfaces are
+#  right - unix sockets, JSON on stdout, exec - then a shell script is enough
+#  to assemble a working agent, and nobody needs a library binding to do it.
+#
+#  Layout:
+#    1. Cells .............. isolation model, paths, environment
+#    2. Output ............. logging helpers
+#    3. Processes .......... pid/socket helpers
+#    4. Binaries ........... resolution and build-from-source
+#    5. Wiring ............. config generation, tool aliases
+#    6. Daemons ............ supervision
+#    7. Commands ........... the CLI surface
+#    8. Dispatch ........... argument parsing
+#
+
+set -euo pipefail
+
+RIG_VERSION="0.1.0"
+RIG_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+#==============================================================================
+# 1. CELLS
+#==============================================================================
+#
+# A "cell" is the unit of isolation. Because pantalk and mcpshim both resolve
+# their socket, config, and database purely from XDG environment variables, a
+# cell is nothing more than a private XDG environment plus a private bindir on
+# PATH. No per-tool flags are required anywhere in rig.
+#
+#   XDG_RUNTIME_DIR -> pantalk.sock, mcpshim.sock
+#   XDG_CONFIG_HOME -> pantalk/config.yaml, mcpshim/config.yaml
+#   XDG_DATA_HOME   -> pantalk.db, mcpshim.db
+#   PATH            -> mcpshim alias wrappers
+#
+# Note this is instance separation, not a security boundary: cells run as the
+# same uid, so a process in one cell can still reach another cell's socket by
+# path. See README "Isolation".
+
+: "${RIG_CELL:=default}"
+: "${RIG_HOME:=${XDG_DATA_HOME:-$HOME/.local/share}/rig}"
+
+# Snapshot the ambient runtime dir before export_cell_env overwrites
+# XDG_RUNTIME_DIR with the cell's own. Without this, any path computed after
+# the export - or by a nested rig invocation - would nest a second time.
+: "${RIG_BASE_RUNTIME_DIR:=${XDG_RUNTIME_DIR:-}}"
+
+cell_dir() { printf '%s/cells/%s' "$RIG_HOME" "$RIG_CELL"; }
+cell_config() { printf '%s/config' "$(cell_dir)"; }
+cell_data() { printf '%s/data' "$(cell_dir)"; }
+cell_cache() { printf '%s/cache' "$(cell_dir)"; }
+cell_bin() { printf '%s/bin' "$(cell_dir)"; }
+cell_logs() { printf '%s/logs' "$(cell_dir)"; }
+cell_env_file() { printf '%s/rig.env' "$(cell_dir)"; }
+
+# Runtime dir holds unix sockets. Kept short and under the user's runtime dir
+# where possible, because sockaddr_un paths are capped near 104 bytes.
+cell_run() {
+	if [ -n "${RIG_BASE_RUNTIME_DIR:-}" ] && [ -d "${RIG_BASE_RUNTIME_DIR}" ]; then
+		printf '%s/rig/%s' "$RIG_BASE_RUNTIME_DIR" "$RIG_CELL"
+	else
+		printf '/tmp/rig-%s/%s' "$(id -u)" "$RIG_CELL"
+	fi
+}
+
+pantalk_socket() { printf '%s/pantalk.sock' "$(cell_run)"; }
+mcpshim_socket() { printf '%s/mcpshim.sock' "$(cell_run)"; }
+pantalk_config() { printf '%s/pantalk/config.yaml' "$(cell_config)"; }
+mcpshim_config() { printf '%s/mcpshim/config.yaml' "$(cell_config)"; }
+pidfile() { printf '%s/%s.pid' "$(cell_run)" "$1"; }
+logfile() { printf '%s/%s.log' "$(cell_logs)" "$1"; }
+
+# Cell settings, written by `rig init` and sourced by every later command.
+RIG_WORKDIR_DEFAULT="$PWD"
+RIG_BOT_DEFAULT="rig-local"
+RIG_SANDBOX_DEFAULT="workspace-write"
+RIG_APPROVAL_DEFAULT="never"
+RIG_TIMEOUT_DEFAULT="900"
+
+load_cell_env() {
+	: "${RIG_WORKDIR:=$RIG_WORKDIR_DEFAULT}"
+	: "${RIG_BOT:=$RIG_BOT_DEFAULT}"
+	: "${RIG_SANDBOX:=$RIG_SANDBOX_DEFAULT}"
+	: "${RIG_APPROVAL:=$RIG_APPROVAL_DEFAULT}"
+	: "${RIG_TIMEOUT:=$RIG_TIMEOUT_DEFAULT}"
+
+	local f
+	f="$(cell_env_file)"
+	if [ -f "$f" ]; then
+		# Values already exported in the caller's environment win, so
+		# `RIG_WORKDIR=/x rig up` overrides the stored setting.
+		local saved_workdir="${RIG_WORKDIR:-}"
+		# shellcheck disable=SC1090
+		. "$f"
+		[ -n "${saved_workdir}" ] && [ "${saved_workdir}" != "$RIG_WORKDIR_DEFAULT" ] &&
+			RIG_WORKDIR="$saved_workdir"
+	fi
+	return 0
+}
+
+# Export the cell's environment. Everything downstream - the daemons, the
+# codex process, an interactive `rig shell` - inherits exactly this.
+export_cell_env() {
+	export XDG_RUNTIME_DIR="$(cell_run)"
+	export XDG_CONFIG_HOME="$(cell_config)"
+	export XDG_DATA_HOME="$(cell_data)"
+	export XDG_CACHE_HOME="$(cell_cache)"
+
+	# Idempotent: `rig shell` followed by `rig codex` must not stack the
+	# bindir onto PATH twice.
+	local bin
+	bin="$(cell_bin)"
+	case ":${PATH}:" in
+	*":${bin}:"*) ;;
+	*) export PATH="${bin}:${PATH}" ;;
+	esac
+	export RIG_CELL RIG_HOME RIG_BASE_RUNTIME_DIR
+}
+
+ensure_cell_dirs() {
+	mkdir -p "$(cell_dir)" "$(cell_config)/pantalk" "$(cell_config)/mcpshim" \
+		"$(cell_data)" "$(cell_cache)" "$(cell_bin)" "$(cell_logs)"
+	# 0700 on the runtime dir is the cheap part of the isolation story: it
+	# keeps other uids off the sockets even though same-uid cells are not
+	# isolated from each other.
+	mkdir -p "$(cell_run)"
+	chmod 700 "$(cell_run)"
+}
+
+#==============================================================================
+# 2. OUTPUT
+#==============================================================================
+
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+	C_DIM=$'\033[2m' C_RED=$'\033[31m' C_GRN=$'\033[32m'
+	C_YEL=$'\033[33m' C_BLU=$'\033[34m' C_RST=$'\033[0m'
+else
+	C_DIM='' C_RED='' C_GRN='' C_YEL='' C_BLU='' C_RST=''
+fi
+
+log() { printf '%s==>%s %s\n' "$C_BLU" "$C_RST" "$*" >&2; }
+ok() { printf '%s  ok%s %s\n' "$C_GRN" "$C_RST" "$*" >&2; }
+warn() { printf '%swarn%s %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
+err() { printf '%s err%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+dim() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST" >&2; }
+die() {
+	err "$*"
+	exit 1
+}
+
+#==============================================================================
+# 3. PROCESSES
+#==============================================================================
+
+# alive <name> - true when the recorded pid is still running.
+alive() {
+	local pf
+	pf="$(pidfile "$1")"
+	[ -f "$pf" ] || return 1
+	local pid
+	pid="$(cat "$pf" 2>/dev/null)" || return 1
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" 2>/dev/null
+}
+
+# wait_for_socket <path> <seconds>
+wait_for_socket() {
+	local path="$1" limit="${2:-10}" waited=0
+	while [ "$waited" -lt "$((limit * 10))" ]; do
+		[ -S "$path" ] && return 0
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	return 1
+}
+
+#==============================================================================
+# 4. BINARIES
+#==============================================================================
+#
+# rig is a distribution, so it never vendors code - it locates binaries. The
+# search order is: an explicit override, then PATH, then a rig-local bindir,
+# then a build from an incubator checkout if one is reachable.
+
+RIG_BINDIR="${RIG_BINDIR:-$RIG_HOME/bin}"
+
+# Where the pantalk / mcpshim sources live when rig is run from inside the
+# cbk-platform incubator. Purely a developer convenience.
+incubator_root() {
+	local d="$RIG_ROOT"
+	while [ "$d" != "/" ]; do
+		if [ -d "$d/incubator/pantalk/tool" ] && [ -d "$d/incubator/mcpshim/tool" ]; then
+			printf '%s/incubator' "$d"
+			return 0
+		fi
+		d="$(dirname "$d")"
+	done
+	return 1
+}
+
+# resolve_bin <name> [override] - print an absolute path or fail.
+resolve_bin() {
+	local name="$1" override="${2:-}"
+	if [ -n "$override" ]; then
+		if [ -x "$override" ]; then
+			printf '%s' "$override"
+			return 0
+		fi
+		return 1
+	fi
+	local found
+	if found="$(command -v "$name" 2>/dev/null)"; then
+		printf '%s' "$found"
+		return 0
+	fi
+	if [ -x "$RIG_BINDIR/$name" ]; then
+		printf '%s' "$RIG_BINDIR/$name"
+		return 0
+	fi
+	return 1
+}
+
+need_bin() {
+	local name="$1" override="${2:-}" path
+	if ! path="$(resolve_bin "$name" "$override")"; then
+		die "$name not found. Run 'rig build' to build it from the incubator, or put it on PATH."
+	fi
+	printf '%s' "$path"
+}
+
+# build_tools - build pantalkd/pantalk/mcpshimd/mcpshim from an incubator
+# checkout into RIG_BINDIR. Only used when the binaries are not installed.
+build_tools() {
+	local inc
+	inc="$(incubator_root)" ||
+		die "no incubator checkout found near $RIG_ROOT; install pantalk and mcpshim manually"
+	command -v go >/dev/null 2>&1 || die "go toolchain required to build (not on PATH)"
+
+	mkdir -p "$RIG_BINDIR"
+	local pair
+	for pair in "pantalk:pantalk pantalkd" "mcpshim:mcpshim mcpshimd"; do
+		local proj="${pair%%:*}" cmds="${pair#*:}"
+		local src="$inc/$proj/tool"
+		[ -d "$src" ] || die "missing source tree: $src"
+		local cmd
+		for cmd in $cmds; do
+			log "building $cmd"
+			(cd "$src" && go build -o "$RIG_BINDIR/$cmd" "./cmd/$cmd") ||
+				die "build failed: $proj/$cmd"
+			ok "$RIG_BINDIR/$cmd"
+		done
+	done
+}
+
+#==============================================================================
+# 5. WIRING
+#==============================================================================
+#
+# rig owns one config surface and projects it down into each tool's native
+# config file. The tools stay independently usable: nothing here is a new
+# format the daemons have to understand.
+
+# The PATH handed to the codex process. Pantalk's agent env is the *complete*
+# environment (nothing is inherited unless listed in env_inherit), so this is
+# resolved to a literal at generation time rather than left as $PATH.
+agent_path() {
+	local codex_bin="$1" parts=()
+	parts+=("$(cell_bin)")             # mcpshim alias wrappers, cell-scoped
+	parts+=("$(dirname "$codex_bin")") # codex, and its runtime if node-based
+	[ -d "$RIG_BINDIR" ] && parts+=("$RIG_BINDIR")
+	parts+=("/usr/local/bin" "/usr/bin" "/bin")
+	local IFS=":"
+	printf '%s' "${parts[*]}"
+}
+
+write_pantalk_config() {
+	local codex_bin="$1" cfg apath
+	cfg="$(pantalk_config)"
+	apath="$(agent_path "$codex_bin")"
+	mkdir -p "$(dirname "$cfg")"
+
+	cat >"$cfg" <<YAML
+# Generated by rig - cell "${RIG_CELL}". Regenerate with: rig init --force
+#
+# Codex is the engine. Pantalk owns the channel edge and drives codex through
+# its native app-server driver, so chat conversations get durable codex threads
+# keyed per user/channel/thread.
+
+server:
+  notification_history_size: 1000
+
+agents:
+  - name: codex
+    driver: codex
+    workdir: ${RIG_WORKDIR}
+    timeout: ${RIG_TIMEOUT}
+    instructions: |
+      You are reachable both from a terminal and from chat. Keep replies short
+      and concrete - they may be read on a phone.
+
+      Tools from connected MCP servers and HTTP services are available as plain
+      shell commands on your PATH, not as MCP tool schemas. Discover them with
+      \`mcpshim tools\`, inspect one with \`mcpshim inspect --server S --tool T\`,
+      and call it with \`mcpshim call --server S --tool T --arg value\`. Output
+      is JSON, so pipe it through jq.
+    env:
+      PATH: "${apath}"
+      HOME: "${HOME}"
+      XDG_RUNTIME_DIR: "$(cell_run)"
+      XDG_CONFIG_HOME: "$(cell_config)"
+      XDG_DATA_HOME: "$(cell_data)"
+      XDG_CACHE_HOME: "$(cell_cache)"
+    env_inherit:
+      - USER
+      - LANG
+      - TERM
+    codex:
+      binary: ${codex_bin}
+      sandbox: ${RIG_SANDBOX}
+      approval_policy: ${RIG_APPROVAL}
+
+bots:
+  # Credential-free offline connector. This is the one bot type that accepts
+  # injected inbound messages, which is what makes 'rig demo' work without any
+  # platform tokens. Add real connectors with 'pantalk config add-bot'.
+  - name: ${RIG_BOT}
+    type: local
+    agents:
+      - agent: codex
+        when: true
+YAML
+	ok "pantalk config -> ${cfg}"
+}
+
+write_mcpshim_config() {
+	local cfg
+	cfg="$(mcpshim_config)"
+	mkdir -p "$(dirname "$cfg")"
+
+	cat >"$cfg" <<YAML
+# Generated by rig - cell "${RIG_CELL}". Regenerate with: rig init --force
+#
+# Register MCP servers and HTTP services here, then 'rig reload'. Runtime
+# registration over the socket stays refused by default: socket access is
+# already equivalent to "may call every registered tool", and enabling it would
+# make socket access equivalent to config write access too.
+
+server:
+  history_size: 1000
+
+servers: []
+YAML
+	ok "mcpshim config -> ${cfg}"
+}
+
+write_cell_env() {
+	local f
+	f="$(cell_env_file)"
+	cat >"$f" <<ENV
+# Generated by rig. Edit and run 'rig init --force' to regenerate configs.
+RIG_WORKDIR="${RIG_WORKDIR}"
+RIG_BOT="${RIG_BOT}"
+RIG_SANDBOX="${RIG_SANDBOX}"
+RIG_APPROVAL="${RIG_APPROVAL}"
+RIG_TIMEOUT="${RIG_TIMEOUT}"
+ENV
+	ok "cell settings -> ${f}"
+}
+
+# Install mcpshim's alias wrappers into the cell bindir. Per-cell rather than
+# the shared ~/.local/bin default, so two cells with overlapping tool names
+# cannot silently overwrite each other's wrappers.
+install_aliases() {
+	local mcpshim_bin="$1" out
+	if ! out="$("$mcpshim_bin" script --install --dir "$(cell_bin)" 2>&1)"; then
+		warn "alias install skipped: ${out}"
+		return 0
+	fi
+	local n
+	n="$(find "$(cell_bin)" -maxdepth 1 -type f -perm -u+x 2>/dev/null | wc -l | tr -d ' ')"
+	ok "tool aliases -> $(cell_bin) (${n})"
+}
+
+#==============================================================================
+# 6. DAEMONS
+#==============================================================================
+#
+# Deliberately dumb: nohup, a pidfile, and a socket readiness check. If this
+# ever needs process groups, restart backoff, or health probes, that is the
+# signal to stop writing bash and write the orchestrator for real.
+
+# start_daemon <name> <binary> [args...]
+start_daemon() {
+	local name="$1" bin="$2"
+	shift 2
+
+	if alive "$name"; then
+		dim "$name already running (pid $(cat "$(pidfile "$name")"))"
+		return 0
+	fi
+
+	local log
+	log="$(logfile "$name")"
+	# Daemons inherit the exported cell environment, so they resolve their own
+	# socket/config/db paths from XDG without a single flag.
+	nohup "$bin" "$@" >>"$log" 2>&1 &
+	local pid=$!
+	printf '%s' "$pid" >"$(pidfile "$name")"
+
+	# A daemon that dies immediately (bad config, port in use) should fail
+	# here rather than surface later as a confusing connection error.
+	sleep 0.2
+	if ! kill -0 "$pid" 2>/dev/null; then
+		rm -f "$(pidfile "$name")"
+		err "$name exited immediately; last lines of $log:"
+		tail -n 15 "$log" >&2 || true
+		return 1
+	fi
+	ok "$name started (pid $pid)"
+}
+
+stop_daemon() {
+	local name="$1"
+	if ! alive "$name"; then
+		dim "$name not running"
+		rm -f "$(pidfile "$name")"
+		return 0
+	fi
+	local pid
+	pid="$(cat "$(pidfile "$name")")"
+	kill "$pid" 2>/dev/null || true
+
+	local waited=0
+	while [ "$waited" -lt 50 ]; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		warn "$name did not stop; sending SIGKILL"
+		kill -9 "$pid" 2>/dev/null || true
+	fi
+	rm -f "$(pidfile "$name")"
+	ok "$name stopped"
+}
+
+daemon_status_line() {
+	local name="$1" sock="$2" state pid=""
+	if alive "$name"; then
+		pid="$(cat "$(pidfile "$name")")"
+		if [ -S "$sock" ]; then
+			state="${C_GRN}running${C_RST}"
+		else
+			state="${C_YEL}running, no socket${C_RST}"
+		fi
+	else
+		state="${C_DIM}stopped${C_RST}"
+	fi
+	printf '  %-10s %-22b %s\n' "$name" "$state" "${pid:+pid $pid}"
+}
+
+#==============================================================================
+# 7. COMMANDS
+#==============================================================================
+
+PANTALK="" PANTALKD="" MCPSHIM="" MCPSHIMD="" CODEX=""
+
+resolve_all() {
+	CODEX="$(need_bin codex "${CODEX_BIN:-}")"
+	PANTALK="$(need_bin pantalk)"
+	PANTALKD="$(need_bin pantalkd)"
+	MCPSHIM="$(need_bin mcpshim)"
+	MCPSHIMD="$(need_bin mcpshimd)"
+}
+
+require_init() {
+	[ -f "$(pantalk_config)" ] ||
+		die "cell '${RIG_CELL}' is not initialized. Run: rig init"
+}
+
+usage() {
+	cat <<'EOF'
+rig - assemble codex, pantalk and mcpshim into one agent
+
+Usage:
+  rig [--cell NAME] <command> [args]
+
+Setup
+  init [--force] [--workdir DIR]   generate this cell's configs
+  build                            build pantalk/mcpshim from an incubator checkout
+  doctor                           check binaries, configs and daemons
+
+Lifecycle
+  up                               start the daemons and install tool aliases
+  down                             stop the daemons
+  restart                          down, then up
+  status                           show what is running
+  logs [pantalk|mcpshim] [-f]      tail daemon logs
+  reload                           reload both daemons' configs
+
+Use it
+  codex [args...]                  run codex inside this cell (the local interface)
+  shell                            open a subshell wired to this cell
+  env                              print the cell environment (eval-able)
+  tools [args...]                  mcpshim tools
+  call <args...>                   mcpshim call
+  demo [text]                      end-to-end proof: inject a message, print the reply
+
+Chat edge
+  send|inject|stream|bots|history  passthrough to pantalk, scoped to this cell
+
+Cells
+  cells                            list cells
+
+Environment
+  RIG_CELL     cell name (default: default)
+  RIG_HOME     state root (default: $XDG_DATA_HOME/rig)
+  CODEX_BIN    override the codex binary
+EOF
+}
+
+cmd_init() {
+	local force=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--force) force=1 ;;
+		--workdir)
+			RIG_WORKDIR="${2:?--workdir needs a value}"
+			shift
+			;;
+		*) die "unknown flag for init: $1" ;;
+		esac
+		shift
+	done
+
+	RIG_WORKDIR="$(cd "$RIG_WORKDIR" && pwd)"
+	resolve_all
+	ensure_cell_dirs
+
+	if [ -f "$(pantalk_config)" ] && [ "$force" -eq 0 ]; then
+		die "cell '${RIG_CELL}' already initialized. Use --force to regenerate."
+	fi
+
+	log "initializing cell '${RIG_CELL}'"
+	write_pantalk_config "$CODEX"
+	write_mcpshim_config
+	write_cell_env
+	dim "workdir: ${RIG_WORKDIR}"
+	dim "next: rig up"
+}
+
+cmd_build() {
+	build_tools
+	dim "binaries in ${RIG_BINDIR}; add it to PATH or let rig find them there"
+}
+
+cmd_up() {
+	require_init
+	resolve_all
+	ensure_cell_dirs
+	export_cell_env
+
+	log "starting cell '${RIG_CELL}'"
+	start_daemon mcpshim "$MCPSHIMD"
+	wait_for_socket "$(mcpshim_socket)" 10 || warn "mcpshim socket not ready"
+
+	# Aliases are installed before pantalk starts so the codex process picks
+	# up a populated bindir on its very first turn.
+	install_aliases "$MCPSHIM"
+
+	start_daemon pantalk "$PANTALKD"
+	wait_for_socket "$(pantalk_socket)" 10 || warn "pantalk socket not ready"
+
+	cmd_status
+	dim "try: rig demo    or: rig codex"
+}
+
+cmd_down() {
+	stop_daemon pantalk
+	stop_daemon mcpshim
+}
+
+cmd_restart() {
+	cmd_down
+	cmd_up
+}
+
+cmd_status() {
+	export_cell_env
+	printf '\n  cell     %s\n' "$RIG_CELL"
+	printf '  workdir  %s\n' "${RIG_WORKDIR}"
+	printf '  runtime  %s\n\n' "$(cell_run)"
+	daemon_status_line mcpshim "$(mcpshim_socket)"
+	daemon_status_line pantalk "$(pantalk_socket)"
+	printf '\n'
+}
+
+cmd_logs() {
+	local name="${1:-pantalk}" follow=""
+	[ "${2:-}" = "-f" ] && follow="-f"
+	[ "${1:-}" = "-f" ] && {
+		name="pantalk"
+		follow="-f"
+	}
+	local f
+	f="$(logfile "$name")"
+	[ -f "$f" ] || die "no log yet: $f"
+	# shellcheck disable=SC2086
+	tail -n 100 $follow "$f"
+}
+
+cmd_reload() {
+	require_init
+	resolve_all
+	export_cell_env
+	"$MCPSHIM" reload || warn "mcpshim reload failed"
+	"$PANTALK" reload || warn "pantalk reload failed"
+}
+
+cmd_codex() {
+	require_init
+	resolve_all
+	export_cell_env
+	cd "$RIG_WORKDIR"
+	exec "$CODEX" "$@"
+}
+
+cmd_shell() {
+	require_init
+	resolve_all
+	export_cell_env
+	log "cell '${RIG_CELL}' - pantalk, mcpshim and tool aliases are on PATH"
+	dim "exit to leave"
+	cd "$RIG_WORKDIR"
+	exec "${SHELL:-/bin/bash}"
+}
+
+cmd_env() {
+	export_cell_env
+	local v
+	for v in XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME PATH RIG_CELL; do
+		printf 'export %s=%q\n' "$v" "${!v}"
+	done
+}
+
+cmd_demo() {
+	require_init
+	resolve_all
+	export_cell_env
+
+	alive pantalk || die "pantalk is not running. Run: rig up"
+	command -v jq >/dev/null 2>&1 || die "demo needs jq"
+
+	local text="${1:-Reply in one short sentence: confirm you are running and name your working directory.}"
+	local wait="${RIG_DEMO_TIMEOUT:-120}"
+	local tmp
+	tmp="$(mktemp)"
+	trap 'rm -f "$tmp"' RETURN
+
+	log "injecting into bot '${RIG_BOT}' (waiting up to ${wait}s)"
+
+	# Stream first, then inject, so the reply cannot be missed in the gap.
+	"$PANTALK" stream --bot "$RIG_BOT" --timeout "$wait" --json >"$tmp" 2>/dev/null &
+	local spid=$!
+	sleep 0.5
+
+	"$PANTALK" inject --bot "$RIG_BOT" --user "rig-operator" --text "$text" >/dev/null ||
+		die "inject failed"
+
+	# Stop as soon as an outbound message lands rather than burning the
+	# full timeout on a fast reply.
+	local waited=0
+	while [ "$waited" -lt "$((wait * 2))" ]; do
+		kill -0 "$spid" 2>/dev/null || break
+		if jq -e -r 'select(.direction=="out" and .kind=="message")' <"$tmp" >/dev/null 2>&1; then
+			kill "$spid" 2>/dev/null || true
+			break
+		fi
+		sleep 0.5
+		waited=$((waited + 1))
+	done
+	wait "$spid" 2>/dev/null || true
+
+	printf '\n'
+	if ! jq -r 'select(.direction=="out" and .kind=="message") | .text' <"$tmp" 2>/dev/null | grep -q .; then
+		err "no reply. Check 'rig logs pantalk' - codex may need auth (codex login)."
+		return 1
+	fi
+	jq -r 'select(.direction=="out" and .kind=="message") | .text' <"$tmp"
+	printf '\n'
+	ok "end to end: pantalk -> codex -> pantalk"
+}
+
+cmd_doctor() {
+	local fail=0
+	printf '\n  binaries\n'
+	local b p
+	for b in codex pantalk pantalkd mcpshim mcpshimd jq; do
+		if p="$(resolve_bin "$b" "$([ "$b" = codex ] && printf '%s' "${CODEX_BIN:-}")" 2>/dev/null)"; then
+			printf '    %-10s %s%s%s\n' "$b" "$C_GRN" "$p" "$C_RST"
+		else
+			printf '    %-10s %smissing%s\n' "$b" "$C_RED" "$C_RST"
+			[ "$b" = jq ] || fail=1
+		fi
+	done
+
+	printf '\n  cell "%s"\n' "$RIG_CELL"
+	local f
+	for f in "$(pantalk_config)" "$(mcpshim_config)" "$(cell_env_file)"; do
+		if [ -f "$f" ]; then
+			printf '    %sok%s      %s\n' "$C_GRN" "$C_RST" "$f"
+		else
+			printf '    %smissing%s %s\n' "$C_YEL" "$C_RST" "$f"
+		fi
+	done
+
+	printf '\n  daemons\n'
+	export_cell_env
+	daemon_status_line mcpshim "$(mcpshim_socket)"
+	daemon_status_line pantalk "$(pantalk_socket)"
+
+	if [ -f "$(pantalk_config)" ] && p="$(resolve_bin pantalk 2>/dev/null)"; then
+		printf '\n  config validation\n'
+		if "$p" validate --config "$(pantalk_config)" >/dev/null 2>&1; then
+			printf '    %sok%s      pantalk config\n' "$C_GRN" "$C_RST"
+		else
+			printf '    %sinvalid%s pantalk config\n' "$C_RED" "$C_RST"
+			fail=1
+		fi
+	fi
+
+	printf '\n'
+	[ "$fail" -eq 0 ] || return 1
+}
+
+cmd_cells() {
+	local d
+	[ -d "$RIG_HOME/cells" ] || {
+		dim "no cells yet"
+		return 0
+	}
+	for d in "$RIG_HOME/cells"/*; do
+		[ -d "$d" ] || continue
+		local name
+		name="$(basename "$d")"
+		local marker=" "
+		[ "$name" = "$RIG_CELL" ] && marker="*"
+		printf ' %s %s\n' "$marker" "$name"
+	done
+}
+
+# Thin passthroughs. rig adds the cell environment and nothing else - the
+# tools keep their own flags, output and JSON contract.
+cmd_pantalk_passthru() {
+	require_init
+	resolve_all
+	export_cell_env
+	exec "$PANTALK" "$@"
+}
+
+cmd_mcpshim_passthru() {
+	require_init
+	resolve_all
+	export_cell_env
+	exec "$MCPSHIM" "$@"
+}
+
+#==============================================================================
+# 8. DISPATCH
+#==============================================================================
+
+while [ $# -gt 0 ]; do
+	case "${1:-}" in
+	--cell)
+		RIG_CELL="${2:?--cell needs a value}"
+		shift 2
+		;;
+	--cell=*)
+		RIG_CELL="${1#--cell=}"
+		shift
+		;;
+	*) break ;;
+	esac
+done
+
+load_cell_env
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+init) cmd_init "$@" ;;
+build) cmd_build "$@" ;;
+up) cmd_up "$@" ;;
+down | stop) cmd_down "$@" ;;
+restart) cmd_restart "$@" ;;
+status) cmd_status "$@" ;;
+logs) cmd_logs "$@" ;;
+reload) cmd_reload "$@" ;;
+codex) cmd_codex "$@" ;;
+shell) cmd_shell "$@" ;;
+env) cmd_env "$@" ;;
+demo) cmd_demo "$@" ;;
+doctor) cmd_doctor "$@" ;;
+cells) cmd_cells "$@" ;;
+tools | call) cmd_mcpshim_passthru "$cmd" "$@" ;;
+send | inject | stream | bots | history | notifications) cmd_pantalk_passthru "$cmd" "$@" ;;
+version | --version) printf 'rig %s\n' "$RIG_VERSION" ;;
+help | -h | --help) usage ;;
+*)
+	err "unknown command: $cmd"
+	usage
+	exit 2
+	;;
+esac
